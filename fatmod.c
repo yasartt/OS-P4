@@ -122,19 +122,38 @@ int writesector(int fd, unsigned char *buf, unsigned int snum) {
 
 void list_root_directory(int fd) {
     unsigned char sector[SECTORSIZE];
-    struct fat_boot_sector *boot;
-    uint32_t root_cluster;
 
+    // Read the boot sector
     readsector(fd, sector, 0);
-    boot = (struct fat_boot_sector *)sector;
-    root_cluster = boot->fat32.root_cluster;
+
+    // Parse the boot sector
+    uint16_t sector_size = *(uint16_t *)(sector + 11);
+    uint8_t sectors_per_cluster = *(uint8_t *)(sector + 13);
+    uint16_t reserved_sector_count = *(uint16_t *)(sector + 14);
+    uint8_t num_fats = *(uint8_t *)(sector + 16);
+    uint32_t total_sectors = *(uint32_t *)(sector + 32);
+    uint32_t sectors_per_fat = *(uint32_t *)(sector + 36);
+    uint32_t root_cluster = *(uint32_t *)(sector + 44);
+
+    printf("Sector Size: %d\n", sector_size);
+    printf("Sectors per Cluster: %d\n", sectors_per_cluster);
+    printf("Reserved Sector Count: %d\n", reserved_sector_count);
+    printf("Number of FATs: %d\n", num_fats);
+    printf("Total Sectors: %d\n", total_sectors);
+    printf("Sectors per FAT: %d\n", sectors_per_fat);
+    printf("Root Cluster: %d\n", root_cluster);
+
+    // Calculate the start sector of the root cluster
+    uint32_t root_cluster_start_sector = reserved_sector_count + (num_fats * sectors_per_fat);
 
     unsigned char cluster[CLUSTERSIZE];
     struct msdos_dir_entry *dep;
 
-    readsector(fd, cluster, root_cluster);
+    // Read the root directory cluster
+    readsector(fd, cluster, root_cluster_start_sector);
     dep = (struct msdos_dir_entry *)cluster;
 
+    // Iterate through directory entries
     for (int i = 0; i < CLUSTERSIZE / sizeof(struct msdos_dir_entry); ++i) {
         if (dep->name[0] == 0x00) break;
         if (dep->name[0] == 0xE5) {
@@ -152,7 +171,6 @@ void list_root_directory(int fd) {
         dep++;
     }
 }
-
 void display_file_ascii(int fd, const char *filename) {
     // Implement the function to display the content of a file in ASCII form
 }
