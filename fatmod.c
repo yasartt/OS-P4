@@ -23,6 +23,7 @@
 #define FAT_EOC 0x0FFFFFF8
 #define FAT_START_SECTOR 32  // Define the start sector of the FAT table
 
+// Function declarations
 int readsector(int fd, unsigned char *buf, unsigned int snum);
 int writesector(int fd, unsigned char *buf, unsigned int snum);
 int readcluster(int fd, unsigned char *buf, unsigned int cnum);
@@ -33,9 +34,12 @@ void display_file_binary(int fd, const char *filename);
 void create_file(int fd, const char *filename);
 void delete_file(int fd, const char *filename);
 void write_to_file(int fd, const char *filename, int offset, int n, int data);
-uint32_t get_next_cluster(int fd, uint32_t cluster);
+uint32_t get_next_cluster(int fd, uint32_t cluster, uint16_t reserved_sector_count);
 uint32_t get_file_size(int fd, uint32_t start_cluster);
 void print_help();
+uint32_t allocate_new_cluster(int fd);
+void set_next_cluster(int fd, uint32_t cluster, uint32_t next_cluster, uint16_t reserved_sector_count);
+struct msdos_dir_entry* find_file_entry(int fd, const char *filename, uint32_t root_cluster_start_sector);
 
 int main(int argc, char *argv[])
 {
@@ -144,7 +148,6 @@ int writecluster(int fd, unsigned char *buf, unsigned int cnum) {
     return 0;  // Successfully wrote the entire cluster
 }
 
-
 void list_root_directory(int fd) {
     unsigned char sector[SECTORSIZE];
 
@@ -176,10 +179,6 @@ void list_root_directory(int fd) {
 
     // Read the root directory cluster
     readsector(fd, cluster, root_cluster_start_sector);
-    // if (readcluster(fd, cluster, root_cluster) != 0) {
-    //     perror("Failed to read root directory cluster");
-    //     return 1;
-    // }
     dep = (struct msdos_dir_entry *)cluster;
 
     // Iterate through directory entries
@@ -200,6 +199,7 @@ void list_root_directory(int fd) {
         dep++;
     }
 }
+
 void display_file_ascii(int fd, const char *filename) {
     unsigned char sector[SECTORSIZE];
     unsigned char cluster[CLUSTERSIZE];
@@ -286,11 +286,10 @@ void display_file_ascii(int fd, const char *filename) {
         for (int i = 0; i < CLUSTERSIZE && read_size < file_size; i++, read_size++) {
             printf("%c", file_buffer[i]);
         }
-        cluster_num = get_next_cluster(fd, cluster_num);
+        cluster_num = get_next_cluster(fd, cluster_num, reserved_sector_count);
     }
     printf("\n");
 }
-
 
 void display_file_binary(int fd, const char *filename) {
     unsigned char sector[SECTORSIZE];
@@ -384,11 +383,10 @@ void display_file_binary(int fd, const char *filename) {
                 printf("%02x ", file_buffer[j]);
             }
         }
-        cluster_num = get_next_cluster(fd, cluster_num);
+        cluster_num = get_next_cluster(fd, cluster_num, reserved_sector_count);
     }
     printf("\n");
 }
-
 
 void create_file(int fd, const char *filename) {
     unsigned char sector[SECTORSIZE];
@@ -417,7 +415,46 @@ void create_file(int fd, const char *filename) {
 
     dep = (struct msdos_dir_entry *)cluster;
 
+    // Check if file with the same name already exists
+    for (int i = 0; i < CLUSTERSIZE / sizeof(struct msdos_dir_entry); ++i) {
+        if (dep->name[0] == 0x00) break;  // End of directory
+        if (dep->name[0] != 0xE5) {  // Valid entry
+            char name[9];
+            char ext[4];
+            strncpy(name, (char *)dep->name, 8);
+            name[8] = '\0';
+            strncpy(ext, (char *)dep->name + 8, 3);
+            ext[3] = '\0';
+
+            // Remove trailing spaces
+            for (int j = 7; j >= 0 && name[j] == ' '; j--) {
+                name[j] = '\0';
+            }
+            for (int j = 2; j >= 0 && ext[j] == ' '; j--) {
+                ext[j] = '\0';
+            }
+
+            // Concatenate name and extension
+            char fullname[13];
+            if (strlen(ext) > 0) {
+                snprintf(fullname, sizeof(fullname), "%s.%s", name, ext);
+            } else {
+                snprintf(fullname, sizeof(fullname), "%s", name);
+            }
+
+            // Convert to uppercase for comparison
+            for (char *p = fullname; *p; ++p) *p = toupper(*p);
+
+            if (strcmp(fullname, filename) == 0) {
+                printf("File already exists: %s\n", filename);
+                return;
+            }
+        }
+        dep++;
+    }
+
     // Locate a free directory entry
+    dep = (struct msdos_dir_entry *)cluster;
     struct msdos_dir_entry *free_entry = NULL;
     for (int i = 0; i < CLUSTERSIZE / sizeof(struct msdos_dir_entry); ++i) {
         if (dep->name[0] == 0x00 || dep->name[0] == 0xE5) {
@@ -468,8 +505,6 @@ void create_file(int fd, const char *filename) {
 
     printf("File created: %s\n", filename);
 }
-
-
 
 void delete_file(int fd, const char *filename) {
     unsigned char sector[SECTORSIZE];
@@ -579,11 +614,8 @@ void delete_file(int fd, const char *filename) {
     printf("File deleted: %s\n", filename);
 }
 
-
-
 void write_to_file(int fd, const char *filename, int offset, int n, int data) {
     unsigned char sector[SECTORSIZE];
-    unsigned char cluster[CLUSTERSIZE];
     struct msdos_dir_entry *dep;
 
     // Read the boot sector
@@ -601,16 +633,16 @@ void write_to_file(int fd, const char *filename, int offset, int n, int data) {
     unsigned int root_cluster_start_sector = reserved_sector_count + (num_fats * sectors_per_fat);
 
     // Read the root directory cluster
-    if (readsector(fd, cluster, root_cluster_start_sector) != 0) {
+    if (readsector(fd, sector, root_cluster_start_sector) != 0) {
         perror("Failed to read root directory cluster");
         return;
     }
 
-    dep = (struct msdos_dir_entry *)cluster;
+    dep = (struct msdos_dir_entry *)sector;
 
     // Locate the file in the root directory
     struct msdos_dir_entry *file_entry = NULL;
-    for (int i = 0; i < CLUSTERSIZE / sizeof(struct msdos_dir_entry); ++i) {
+    for (int i = 0; i < SECTORSIZE / sizeof(struct msdos_dir_entry); ++i) {
         if (dep->name[0] == 0x00) break;  // End of directory
         if (dep->name[0] != 0xE5) {  // Valid entry
             char name[9];
@@ -652,113 +684,146 @@ void write_to_file(int fd, const char *filename, int offset, int n, int data) {
         return;
     }
 
-    uint32_t cluster_num = le16toh(file_entry->start) | (le16toh(file_entry->starthi) << 16);
-    uint32_t file_size = le32toh(file_entry->size);
-    uint32_t file_offset = offset;
-    unsigned char write_buffer[CLUSTERSIZE];
-    memset(write_buffer, data, CLUSTERSIZE);
+    // Get the start cluster and file size
+    uint32_t start_cluster = le16toh(file_entry->start) | (le16toh(file_entry->starthi) << 16);
+    uint32_t file_size = file_entry->size;
 
-    while (file_offset >= CLUSTERSIZE) {
-        if (cluster_num >= FAT_EOC) {
-            printf("Offset exceeds file size\n");
-            return;
+    // Calculate the starting cluster and intra-cluster offset
+    uint32_t cluster_num = start_cluster;
+    uint32_t cluster_offset = offset / CLUSTERSIZE;
+    uint32_t intra_cluster_offset = offset % CLUSTERSIZE;
+
+    // Traverse to the correct starting cluster
+    while (cluster_offset > 0) {
+        uint32_t next_cluster = get_next_cluster(fd, cluster_num, reserved_sector_count);
+        if (next_cluster >= FAT_EOC) {
+            next_cluster = allocate_new_cluster(fd);
+            set_next_cluster(fd, cluster_num, next_cluster, reserved_sector_count);
         }
-        file_offset -= CLUSTERSIZE;
-        cluster_num = get_next_cluster(fd, cluster_num);
+        cluster_num = next_cluster;
+        cluster_offset--;
     }
 
-    int bytes_written = 0;
-    while (bytes_written < n) {
-        if (cluster_num >= FAT_EOC || cluster_num == 0) {
-            // Allocate new cluster
-            uint32_t new_cluster = allocate_cluster(fd);
-            if (new_cluster == 0) {
-                printf("No free clusters available\n");
-                return;
+    // Start writing data byte by byte
+    uint32_t written = 0;
+    unsigned char sector_buffer[SECTORSIZE];
+    unsigned int sector_num = (cluster_num - 2) * SECTORS_PER_CLUSTER + root_cluster_start_sector;
+
+    while (written < n) {
+        // Calculate sector and intra-sector offset
+        uint32_t sector_offset = intra_cluster_offset / SECTORSIZE;
+        uint32_t intra_sector_offset = intra_cluster_offset % SECTORSIZE;
+
+        // Read the current sector
+        if (readsector(fd, sector_buffer, sector_num + sector_offset) != 0) {
+            perror("Failed to read file sector");
+            return;
+        }
+
+        // Write data to the buffer
+        while (intra_sector_offset < SECTORSIZE && written < n) {
+            sector_buffer[intra_sector_offset++] = (unsigned char)data;
+            written++;
+        }
+
+        // Write the modified sector back to the disk
+        if (writesector(fd, sector_buffer, sector_num + sector_offset) != 0) {
+            perror("Failed to write file sector");
+            return;
+        }
+
+        // Move to the next sector if necessary
+        if (intra_sector_offset == SECTORSIZE) {
+            intra_cluster_offset += SECTORSIZE;
+            intra_sector_offset = 0;
+
+            // Move to the next cluster if necessary
+            if (intra_cluster_offset >= CLUSTERSIZE) {
+                uint32_t next_cluster = get_next_cluster(fd, cluster_num, reserved_sector_count);
+                if (next_cluster >= FAT_EOC) {
+                    next_cluster = allocate_new_cluster(fd);
+                    set_next_cluster(fd, cluster_num, next_cluster, reserved_sector_count);
+                }
+                cluster_num = next_cluster;
+                intra_cluster_offset = 0;
+                sector_num = (cluster_num - 2) * SECTORS_PER_CLUSTER + root_cluster_start_sector;
             }
-            set_fat_entry(fd, cluster_num, new_cluster);
-            cluster_num = new_cluster;
-            set_fat_entry(fd, cluster_num, FAT_EOC);
         }
-
-        unsigned int cluster_start_sector = root_cluster_start_sector + (cluster_num - 2) * SECTORS_PER_CLUSTER;
-        if (readsector(fd, cluster, cluster_start_sector) != 0) {
-            perror("Failed to read file cluster");
-            return;
-        }
-
-        for (int i = file_offset; i < CLUSTERSIZE && bytes_written < n; i++, bytes_written++) {
-            cluster[i] = data;
-        }
-
-        if (writesector(fd, cluster, cluster_start_sector) != 0) {
-            perror("Failed to write file cluster");
-            return;
-        }
-
-        file_offset = 0;  // Reset file_offset for subsequent clusters
-        cluster_num = get_next_cluster(fd, cluster_num);
     }
 
+    // Update the file size if we wrote past the original end
     if (offset + n > file_size) {
-        file_entry->size = htole32(offset + n);
+        file_entry->size = offset + n;
+        if (writesector(fd, sector, root_cluster_start_sector) != 0) {
+            perror("Failed to update directory entry");
+            return;
+        }
     }
 
-    // Write the updated root directory back to disk
-    if (writesector(fd, cluster, root_cluster_start_sector) != 0) {
-        perror("Failed to write root directory cluster");
-        return;
-    }
-
-    printf("Data written to file: %s\n", filename);
+    printf("Successfully wrote %d bytes to %s\n", n, filename);
 }
 
-uint32_t allocate_cluster(int fd) {
+
+
+// Define the helper functions
+
+uint32_t allocate_new_cluster(int fd) {
     unsigned char sector[SECTORSIZE];
-    for (uint32_t i = 2; ; i++) {
-        uint32_t fat_offset = i * 4;
+    unsigned char sectorBoot[SECTORSIZE];
+    readsector(fd, sectorBoot, 0);
+    uint16_t reserved_sector_count = *(uint16_t *)(sectorBoot + 14);
+    uint32_t sectors_per_fat = *(uint32_t *)(sectorBoot + 36);
+
+    for (uint32_t cluster = 2; cluster < sectors_per_fat * SECTORSIZE / 4; cluster++) {
+        uint32_t fat_offset = cluster * 4;
         uint32_t sector_number = reserved_sector_count + (fat_offset / SECTORSIZE);
         uint32_t entry_offset = fat_offset % SECTORSIZE;
 
         if (readsector(fd, sector, sector_number) != 0) {
             perror("Failed to read FAT sector");
-            return 0;
+            exit(1);
         }
 
-        uint32_t *fat_entry = (uint32_t *)(sector + entry_offset);
-        if ((*fat_entry & 0x0FFFFFFF) == 0) {
-            *fat_entry = 0x0FFFFFF8;  // Mark cluster as allocated
+        uint32_t value = *(uint32_t *)(sector + entry_offset) & 0x0FFFFFFF;
+        if (value == 0) {
+            *(uint32_t *)(sector + entry_offset) = FAT_EOC;
             if (writesector(fd, sector, sector_number) != 0) {
                 perror("Failed to write FAT sector");
-                return 0;
+                exit(1);
             }
-            return i;
+            return cluster;
         }
     }
+
+    perror("No free cluster found");
+    exit(1);
 }
 
-void set_fat_entry(int fd, uint32_t cluster, uint32_t value) {
+void set_next_cluster(int fd, uint32_t cluster, uint32_t next_cluster, uint16_t reserved_sector_count) {
     unsigned char sector[SECTORSIZE];
+
     uint32_t fat_offset = cluster * 4;
     uint32_t sector_number = reserved_sector_count + (fat_offset / SECTORSIZE);
     uint32_t entry_offset = fat_offset % SECTORSIZE;
 
     if (readsector(fd, sector, sector_number) != 0) {
         perror("Failed to read FAT sector");
-        return;
+        exit(1);
     }
 
-    uint32_t *fat_entry = (uint32_t *)(sector + entry_offset);
-    *fat_entry = value & 0x0FFFFFFF;  // Set new cluster value
+    *(uint32_t *)(sector + entry_offset) = next_cluster;
 
     if (writesector(fd, sector, sector_number) != 0) {
         perror("Failed to write FAT sector");
+        exit(1);
     }
 }
 
-uint32_t get_next_cluster(int fd, uint32_t cluster) {
+
+uint32_t get_next_cluster(int fd, uint32_t cluster, uint16_t reserved_sector_count) {
     unsigned char sector[SECTORSIZE];
     uint32_t fat_offset = cluster * 4;
+
     uint32_t sector_number = reserved_sector_count + (fat_offset / SECTORSIZE);
     uint32_t entry_offset = fat_offset % SECTORSIZE;
 
@@ -771,14 +836,20 @@ uint32_t get_next_cluster(int fd, uint32_t cluster) {
     return next_cluster;
 }
 
-
 uint32_t get_file_size(int fd, uint32_t start_cluster) {
     uint32_t cluster = start_cluster;
     uint32_t size = 0;
 
+    unsigned char sector[SECTORSIZE];
+
+    // Read the boot sector
+    readsector(fd, sector, 0);
+
+    uint16_t reserved_sector_count = *(uint16_t *)(sector + 14);
+
     while (cluster < FAT_EOC) {
         size += CLUSTERSIZE;
-        cluster = get_next_cluster(fd, cluster);
+        cluster = get_next_cluster(fd, cluster, reserved_sector_count);
     }
 
     return size;
